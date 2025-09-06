@@ -4,8 +4,7 @@ Agent-related models for the A2A protocol.
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Union
-from enum import Enum
+from typing import Dict, List, Optional, Any
 
 from .base import BaseModel
 
@@ -62,6 +61,8 @@ class AgentCard(BaseModel):
     description: str
     url: str
     version: str = "1.0.0"
+    protocol_version: str = "0.3.0"  # A2A protocol version
+    preferred_transport: str = "JSONRPC"  # A2A specification default
     authentication: Optional[str] = None
     capabilities: Dict[str, Any] = field(default_factory=lambda: {
         "streaming": False,
@@ -81,6 +82,8 @@ class AgentCard(BaseModel):
             "description": self.description,
             "url": self.url,
             "version": self.version,
+            "protocolVersion": self.protocol_version,
+            "preferredTransport": self.preferred_transport,
             "capabilities": self.capabilities,
             "defaultInputModes": self.default_input_modes,
             "defaultOutputModes": self.default_output_modes,
@@ -111,6 +114,8 @@ class AgentCard(BaseModel):
             description=data.get("description", ""),
             url=data.get("url", ""),
             version=data.get("version", "1.0.0"),
+            protocol_version=data.get("protocolVersion", "0.3.0"),
+            preferred_transport=data.get("preferredTransport", "JSONRPC"),
             authentication=data.get("authentication"),
             capabilities=data.get("capabilities", {
                 "streaming": False,
@@ -123,3 +128,31 @@ class AgentCard(BaseModel):
             provider=data.get("provider"),
             documentation_url=data.get("documentationUrl")
         )
+    
+    def validate_a2a_protocol(self) -> List[str]:
+        """
+        Validate agent card against A2A protocol specification.
+        
+        Returns:
+            List of protocol violations (empty if compliant)
+        """
+        violations = []
+        
+        # A2A specification required fields
+        required_fields = ['name', 'description', 'url', 'version', 'protocolVersion', 'skills', 'capabilities', 'defaultInputModes', 'defaultOutputModes']
+        
+        for field in required_fields:
+            field_name = field.replace('protocolVersion', 'protocol_version').replace('defaultInputModes', 'default_input_modes').replace('defaultOutputModes', 'default_output_modes')
+            field_value = getattr(self, field_name, None)
+            
+            if field_value is None:
+                violations.append(f"A2A protocol requires field: {field}")
+            elif field in ['name', 'description', 'url', 'version', 'protocolVersion'] and not field_value:
+                violations.append(f"A2A protocol requires non-empty field: {field}")
+            # For lists (skills, defaultInputModes, defaultOutputModes), empty lists are valid
+        
+        # Check capabilities is a dictionary
+        if not isinstance(self.capabilities, dict):
+            violations.append("A2A protocol requires capabilities to be an object")
+        
+        return violations

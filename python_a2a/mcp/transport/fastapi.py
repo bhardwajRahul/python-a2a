@@ -13,6 +13,19 @@ from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# JSON-RPC models
+class JSONRPCRequest(BaseModel):
+    jsonrpc: str = "2.0"
+    method: str
+    params: Optional[Dict[str, Any]] = None
+    id: Optional[Any] = None
+
+class JSONRPCResponse(BaseModel):
+    jsonrpc: str = "2.0"
+    result: Optional[Any] = None
+    error: Optional[Dict[str, Any]] = None
+    id: Optional[Any] = None
+
 from ..fastmcp import FastMCP, MCPResponse
 
 # Configure logging
@@ -121,5 +134,111 @@ def create_fastapi_app(mcp_server: FastMCP) -> FastAPI:
                 is_error=True
             )
             return error_response.to_dict()
+    
+    # JSON-RPC endpoint for MCP protocol compliance
+    @app.post("/")
+    async def json_rpc_endpoint(request: Request):
+        """Handle JSON-RPC requests for MCP protocol"""
+        try:
+            # Parse JSON-RPC request
+            body = await request.json()
+            
+            if not isinstance(body, dict):
+                return JSONRPCResponse(
+                    error={"code": -32600, "message": "Invalid Request"},
+                    id=body.get("id") if isinstance(body, dict) else None
+                ).dict()
+            
+            jsonrpc_version = body.get("jsonrpc")
+            if jsonrpc_version != "2.0":
+                return JSONRPCResponse(
+                    error={"code": -32600, "message": "Invalid Request - jsonrpc must be '2.0'"},
+                    id=body.get("id")
+                ).dict()
+            
+            method = body.get("method")
+            params = body.get("params", {})
+            request_id = body.get("id")
+            
+            # Handle different MCP methods
+            try:
+                if method == "tools/list":
+                    tools = mcp_server.get_tools()
+                    return JSONRPCResponse(result={"tools": tools}, id=request_id).dict()
+                
+                elif method == "tools/call":
+                    tool_name = params.get("name")
+                    arguments = params.get("arguments", {})
+                    
+                    if not tool_name:
+                        return JSONRPCResponse(
+                            error={"code": -32602, "message": "Missing required parameter: name"},
+                            id=request_id
+                        ).dict()
+                    
+                    try:
+                        response = await mcp_server.call_tool(tool_name, arguments)
+                        return JSONRPCResponse(result=response.to_dict(), id=request_id).dict()
+                    except ValueError as e:
+                        return JSONRPCResponse(
+                            error={"code": -32000, "message": f"Tool not found: {tool_name}"},
+                            id=request_id
+                        ).dict()
+                    except Exception as e:
+                        return JSONRPCResponse(
+                            error={"code": -32603, "message": f"Internal error: {str(e)}"},
+                            id=request_id
+                        ).dict()
+                
+                elif method == "resources/list":
+                    resources = mcp_server.get_resources()
+                    return JSONRPCResponse(result={"resources": resources}, id=request_id).dict()
+                
+                elif method == "resources/read":
+                    uri = params.get("uri")
+                    if not uri:
+                        return JSONRPCResponse(
+                            error={"code": -32602, "message": "Missing required parameter: uri"},
+                            id=request_id
+                        ).dict()
+                    
+                    try:
+                        response = await mcp_server.get_resource(uri)
+                        return JSONRPCResponse(result=response.to_dict(), id=request_id).dict()
+                    except ValueError as e:
+                        return JSONRPCResponse(
+                            error={"code": -32000, "message": f"Resource not found: {uri}"},
+                            id=request_id
+                        ).dict()
+                    except Exception as e:
+                        return JSONRPCResponse(
+                            error={"code": -32603, "message": f"Internal error: {str(e)}"},
+                            id=request_id
+                        ).dict()
+                
+                else:
+                    return JSONRPCResponse(
+                        error={"code": -32601, "message": f"Method not found: {method}"},
+                        id=request_id
+                    ).dict()
+                    
+            except Exception as e:
+                logger.error(f"Error handling JSON-RPC method {method}: {e}")
+                return JSONRPCResponse(
+                    error={"code": -32603, "message": f"Internal error: {str(e)}"},
+                    id=request_id
+                ).dict()
+                
+        except json.JSONDecodeError:
+            return JSONRPCResponse(
+                error={"code": -32700, "message": "Parse error"},
+                id=None
+            ).dict()
+        except Exception as e:
+            logger.error(f"Error processing JSON-RPC request: {e}")
+            return JSONRPCResponse(
+                error={"code": -32603, "message": f"Internal error: {str(e)}"},
+                id=None
+            ).dict()
     
     return app

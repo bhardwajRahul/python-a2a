@@ -485,17 +485,97 @@ def to_langchain_tool(mcp_url, tool_name=None):
             except ImportError:
                 raise ImportError("Cannot import Tool class from LangChain")
         
-        # Get available tools from MCP server
+        # Get available tools from MCP server - try multiple discovery methods
+        available_tools = None
+        discovery_errors = []
+        
         try:
-            tools_response = requests.get(f"{mcp_url}/tools")
-            if tools_response.status_code != 200:
-                raise MCPToolConversionError(f"Failed to get tools from MCP server: {tools_response.status_code}")
-            
-            available_tools = tools_response.json()
-            logger.info(f"Found {len(available_tools)} tools on MCP server")
-        except Exception as e:
-            logger.error(f"Error getting tools from MCP server: {e}")
-            raise MCPToolConversionError(f"Failed to get tools from MCP server: {str(e)}")
+            # Method 1: Try GET request (python-a2a FastMCP style)
+            logger.debug("Trying GET /tools for tool discovery")
+            tools_response = requests.get(f"{mcp_url}/tools", timeout=10)
+            if tools_response.status_code == 200:
+                available_tools = tools_response.json()
+                logger.info(f"Found {len(available_tools)} tools using GET /tools")
+            else:
+                discovery_errors.append(f"GET /tools returned {tools_response.status_code}")
+        except requests.exceptions.RequestException as e:
+            discovery_errors.append(f"GET /tools failed: {str(e)}")
+        
+        # Method 2: Try POST request (fastmcp package style) 
+        if available_tools is None:
+            try:
+                logger.debug("Trying POST /tools for tool discovery")
+                tools_response = requests.post(f"{mcp_url}/tools", timeout=10)
+                if tools_response.status_code == 200:
+                    available_tools = tools_response.json()
+                    logger.info(f"Found {len(available_tools)} tools using POST /tools")
+                else:
+                    discovery_errors.append(f"POST /tools returned {tools_response.status_code}")
+            except requests.exceptions.RequestException as e:
+                discovery_errors.append(f"POST /tools failed: {str(e)}")
+        
+        # Method 3: Try MCP JSON-RPC protocol for tools/list
+        if available_tools is None:
+            try:
+                logger.debug("Trying MCP JSON-RPC tools/list")
+                json_rpc_request = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }
+                tools_response = requests.post(
+                    mcp_url, 
+                    json=json_rpc_request,
+                    headers={"Content-Type": "application/json"},
+                    timeout=10
+                )
+                if tools_response.status_code == 200:
+                    response_data = tools_response.json()
+                    if "result" in response_data and "tools" in response_data["result"]:
+                        available_tools = response_data["result"]["tools"]
+                        logger.info(f"Found {len(available_tools)} tools using MCP JSON-RPC")
+                    else:
+                        discovery_errors.append("MCP JSON-RPC response missing 'result.tools'")
+                else:
+                    discovery_errors.append(f"MCP JSON-RPC returned {tools_response.status_code}")
+            except requests.exceptions.RequestException as e:
+                discovery_errors.append(f"MCP JSON-RPC failed: {str(e)}")
+            except (KeyError, ValueError) as e:
+                discovery_errors.append(f"MCP JSON-RPC response parsing failed: {str(e)}")
+        
+        # Method 4: Try using the python-a2a MCP client directly
+        if available_tools is None:
+            try:
+                logger.debug("Trying python-a2a MCP client for tool discovery")
+                from ..mcp.client import MCPClient
+                
+                # Try to create MCP client and get tools
+                mcp_client = MCPClient(server_url=mcp_url)
+                tools_list = mcp_client.get_tools_sync()
+                if tools_list:
+                    available_tools = tools_list
+                    logger.info(f"Found {len(available_tools)} tools using MCP client")
+                else:
+                    discovery_errors.append("MCP client returned empty tools list")
+            except Exception as e:
+                discovery_errors.append(f"MCP client failed: {str(e)}")
+        
+        # If all methods failed, handle fallback
+        if available_tools is None:
+            if tool_name:
+                # If a specific tool is requested, create it anyway with a warning
+                logger.warning(f"Could not discover tools from server, creating tool '{tool_name}' directly")
+                logger.debug(f"Discovery attempts failed: {'; '.join(discovery_errors)}")
+                available_tools = [{"name": tool_name, "description": f"MCP Tool: {tool_name}"}]
+            else:
+                # No tool name specified and discovery failed
+                error_summary = "; ".join(discovery_errors[:3])  # Limit error message length
+                raise MCPToolConversionError(
+                    f"Failed to get tools from MCP server: {error_summary}. "
+                    f"Tried GET/POST /tools, MCP JSON-RPC, and python-a2a client. "
+                    f"Server might not be running or might not follow MCP protocol."
+                )
         
         # Filter tools if a specific tool is requested
         if tool_name is not None:
@@ -542,30 +622,112 @@ def to_langchain_tool(mcp_url, tool_name=None):
                                 # Default to 'input' parameter
                                 kwargs = {"input": input_value}
                         
-                        # Call the MCP tool
-                        response = requests.post(
-                            f"{mcp_url}/tools/{tool_name}",
-                            json=kwargs
-                        )
+                        # Call the MCP tool - try multiple execution methods
+                        execution_result = None
+                        execution_errors = []
                         
-                        if response.status_code != 200:
-                            return f"Error: HTTP {response.status_code} - {response.text}"
+                        # Method 1: Try REST API call (FastMCP style)
+                        try:
+                            response = requests.post(
+                                f"{mcp_url}/tools/{tool_name}",
+                                json=kwargs,
+                                timeout=30
+                            )
+                            
+                            if response.status_code == 200:
+                                result = response.json()
+                                
+                                # Process error in response
+                                if "error" in result:
+                                    execution_result = f"Error: {result['error']}"
+                                # Process content in response
+                                elif "content" in result:
+                                    content = result.get("content", [])
+                                    if content and isinstance(content, list) and "text" in content[0]:
+                                        execution_result = content[0]["text"]
+                                    else:
+                                        execution_result = str(result)
+                                # Handle isError response format
+                                elif "isError" in result and result["isError"]:
+                                    execution_result = f"Error: {result.get('content', [{}])[0].get('text', 'Unknown error')}"
+                                else:
+                                    execution_result = str(result)
+                            else:
+                                execution_errors.append(f"REST API returned {response.status_code}: {response.text[:100]}")
+                        except requests.exceptions.RequestException as e:
+                            execution_errors.append(f"REST API failed: {str(e)}")
                         
-                        # Parse the response
-                        result = response.json()
+                        # Method 2: Try MCP JSON-RPC protocol
+                        if execution_result is None:
+                            try:
+                                json_rpc_request = {
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": tool_name,
+                                        "arguments": kwargs
+                                    }
+                                }
+                                response = requests.post(
+                                    mcp_url,
+                                    json=json_rpc_request,
+                                    headers={"Content-Type": "application/json"},
+                                    timeout=30
+                                )
+                                
+                                if response.status_code == 200:
+                                    rpc_result = response.json()
+                                    if "result" in rpc_result:
+                                        result_data = rpc_result["result"]
+                                        if "content" in result_data:
+                                            content = result_data["content"]
+                                            if content and isinstance(content, list) and "text" in content[0]:
+                                                execution_result = content[0]["text"]
+                                            else:
+                                                execution_result = str(result_data)
+                                        else:
+                                            execution_result = str(result_data)
+                                    elif "error" in rpc_result:
+                                        execution_result = f"Error: {rpc_result['error'].get('message', 'Unknown RPC error')}"
+                                    else:
+                                        execution_result = str(rpc_result)
+                                else:
+                                    execution_errors.append(f"JSON-RPC returned {response.status_code}")
+                            except requests.exceptions.RequestException as e:
+                                execution_errors.append(f"JSON-RPC failed: {str(e)}")
+                            except (KeyError, ValueError) as e:
+                                execution_errors.append(f"JSON-RPC parsing failed: {str(e)}")
                         
-                        # Process error in response
-                        if "error" in result:
-                            return f"Error: {result['error']}"
+                        # Method 3: Try using the python-a2a MCP client directly
+                        if execution_result is None:
+                            try:
+                                from ..mcp.client import MCPClient
+                                mcp_client = MCPClient(server_url=mcp_url)
+                                client_result = mcp_client.call_tool_sync(tool_name, kwargs)
+                                
+                                if hasattr(client_result, 'content') and client_result.content:
+                                    if isinstance(client_result.content, list) and client_result.content:
+                                        first_content = client_result.content[0]
+                                        if isinstance(first_content, dict) and "text" in first_content:
+                                            execution_result = first_content["text"]
+                                        else:
+                                            execution_result = str(first_content)
+                                    else:
+                                        execution_result = str(client_result.content)
+                                elif hasattr(client_result, 'is_error') and client_result.is_error:
+                                    execution_result = f"Error: {str(client_result)}"
+                                else:
+                                    execution_result = str(client_result)
+                            except Exception as e:
+                                execution_errors.append(f"MCP client failed: {str(e)}")
                         
-                        # Process content in response
-                        if "content" in result:
-                            content = result.get("content", [])
-                            if content and isinstance(content, list) and "text" in content[0]:
-                                return content[0]["text"]
+                        # If all methods failed, return error summary
+                        if execution_result is None:
+                            error_summary = "; ".join(execution_errors[:2])  # Limit error length
+                            return f"Failed to execute tool '{tool_name}': {error_summary}"
                         
-                        # If no structured content, return the raw result
-                        return str(result)
+                        return execution_result
                     except Exception as e:
                         logger.exception(f"Error calling MCP tool {tool_name}")
                         return f"Error calling tool: {str(e)}"

@@ -66,7 +66,12 @@ class A2AServer(BaseA2AServer):
         """Create a default agent card from attributes"""
         name = kwargs.get("name", getattr(self.__class__, "name", "A2A Agent"))
         description = kwargs.get("description", getattr(self.__class__, "description", "A2A-compatible agent"))
-        url = kwargs.get("url", None)
+        # URL is required for A2A protocol - must be provided by user
+        url = kwargs.get("url")
+        if not url:
+            raise A2AConfigurationError(
+                "URL is required for A2A agent card. Please provide a valid URL when creating the agent."
+            )
         version = kwargs.get("version", getattr(self.__class__, "version", "1.0.0"))
         
         # Check for Google A2A compatibility flag - default to True since this is an A2A implementation
@@ -425,6 +430,12 @@ class A2AServer(BaseA2AServer):
         @app.route("/agent.json", methods=["GET"])
         def agent_card():
             """Return the agent card as JSON (standard location)"""
+            return jsonify(self.agent_card.to_dict())
+        
+        # A2A specification compliant endpoint for agent discovery
+        @app.route("/.well-known/agent-card.json", methods=["GET"])
+        def well_known_agent_card():
+            """Return the agent card as JSON (A2A specification location)"""
             return jsonify(self.agent_card.to_dict())
         
         # Task endpoints with proper JSON-RPC
@@ -923,6 +934,7 @@ class A2AServer(BaseA2AServer):
             True if using Google A2A format, False otherwise
         """
         return self._use_google_a2a
+    
         
     def _handle_tasks_send_subscribe(self, params, rpc_id):
         """
